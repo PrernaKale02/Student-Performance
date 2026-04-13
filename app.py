@@ -1,7 +1,9 @@
 import streamlit as st
 import numpy as np
 import joblib
-from tensorflow.keras.models import load_model
+import json
+import h5py
+from tensorflow import keras
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Student Performance Predictor", page_icon="🎓", layout="wide")
@@ -15,6 +17,14 @@ st.markdown("""
     }
     .stApp {
         background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
+    }
+    .stApp,
+    .stApp p,
+    .stApp span,
+    .stApp div,
+    .stApp label,
+    .stApp li {
+        color: black;
     }
     [data-testid="stHeader"] {
         background: rgba(0,0,0,0);
@@ -37,7 +47,7 @@ st.markdown("""
     }
     .stButton>button {
         background: linear-gradient(45deg, #1976d2, #42a5f5);
-        color: white;
+        color: black;
         border: none;
         border-radius: 12px;
         padding: 0.8rem 2rem;
@@ -49,7 +59,7 @@ st.markdown("""
     .stButton>button:hover {
         transform: translateY(-2px);
         box-shadow: 0 6px 20px rgba(25, 118, 210, 0.3);
-        color: white;
+        color: black;
     }
     .metric-card {
         background: #ffffff;
@@ -70,16 +80,64 @@ st.markdown("""
         color: #1a237e !important;
         font-size: 1.1rem;
     }
+    [data-testid="stMetricValue"],
+    [data-testid="stMetricLabel"],
+    .stSelectbox * ,
+    .stSlider * ,
+    .stNumberInput * ,
+    .stTextInput * ,
+    .stSuccess {
+        color: black !important;
+    }
+    [data-baseweb="select"] * {
+        color: white !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # --- LOAD MODELS ---
+def build_model_from_h5(path):
+    with h5py.File(path, "r") as h5_file:
+        model_config = h5_file.attrs["model_config"]
+        if isinstance(model_config, bytes):
+            model_config = model_config.decode("utf-8")
+
+    config = json.loads(model_config)
+    layers_config = config["config"]["layers"]
+    model_layers = []
+    input_shape = None
+
+    for layer in layers_config:
+        class_name = layer["class_name"]
+        layer_config = layer["config"]
+
+        if class_name == "InputLayer":
+            batch_shape = layer_config.get("batch_shape") or layer_config.get("batch_input_shape")
+            input_shape = tuple(batch_shape[1:])
+        elif class_name == "Dense":
+            if not model_layers and input_shape is not None:
+                model_layers.append(keras.Input(shape=input_shape))
+            model_layers.append(
+                keras.layers.Dense(
+                    units=layer_config["units"],
+                    activation=layer_config["activation"],
+                    use_bias=layer_config["use_bias"],
+                    name=layer_config.get("name"),
+                )
+            )
+
+    model = keras.Sequential(model_layers, name=config["config"].get("name"))
+    model.load_weights(path)
+    return model
+
+
 @st.cache_resource
 def load_assets():
-    reg_model = load_model("regression_model.h5")
-    class_model = load_model("classifier_model.h5")
+    reg_model = build_model_from_h5("regression_model.h5")
+    class_model = build_model_from_h5("classifier_model.h5")
     scaler = joblib.load("scaler.pkl")
     return reg_model, class_model, scaler
+
 
 reg_model, class_model, scaler = load_assets()
 
@@ -116,10 +174,10 @@ scaled = scaler.transform(input_data)
 st.write("") # Spacer
 if st.button("🚀 Predict Performance", use_container_width=True):
     with st.spinner("Analyzing data..."):
-        score_pred = reg_model.predict(scaled)[0][0]
-        grade_pred = class_model.predict(scaled)
-        grade_index = grade_pred.argmax()
-        grades = ["Fail", "Pass", "B", "A"]
+        score_pred = float(reg_model.predict(scaled, verbose=0)[0][0])
+        grade_probs = class_model.predict(scaled, verbose=0)[0]
+        grade_index = int(np.argmax(grade_probs))
+        final_status = "Fail" if grade_index == 0 else "Pass"
         
         st.divider()
         st.subheader("📊 Prediction Results")
@@ -130,10 +188,11 @@ if st.button("🚀 Predict Performance", use_container_width=True):
             st.metric(label="Estimated Exam Score", value=f"{round(score_pred, 2)} / 100")
             
         with res_col2:
-            st.metric(label="Final Grade Category", value=grades[grade_index])
+            st.metric(label="Final Grade Category", value=final_status)
         
         # Add a progress bar for the score
         st.progress(min(max(int(score_pred), 0), 100))
+        st.caption(f"Confidence: {grade_probs[grade_index] * 100:.1f}%")
         
         st.success("Analysis complete! Keep up the great work!")
 
